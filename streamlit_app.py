@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -15,6 +16,11 @@ st.caption("Production-hardened LLM pipeline with Circuit Breakers & Pre-Retriev
 st.sidebar.header("⚙️ Production Guardrails")
 enable_pii_guard = st.sidebar.toggle("Pre-Retrieval PII Masking (Issue #5)", value=True)
 enable_circuit_breaker = st.sidebar.toggle("State Circuit Breaker (Issue #1)", value=True)
+
+# Fault Injection Controls for Demo/Observability
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧪 Fault Injection Testing")
+simulate_failure = st.sidebar.toggle("Simulate API / Tool Crash", value=False)
 
 # 1. PII Sanitizer Function (Issue #5 Fix)
 def sanitize_pii(text: str) -> tuple[str, bool]:
@@ -40,7 +46,7 @@ def sanitize_pii(text: str) -> tuple[str, bool]:
 # 2. LLM Setup
 groq_key = os.getenv("GROQ_API_KEY")
 llm = ChatGroq(
-    model="openai/gpt-oss-20b",
+    model="llama-3.3-70b-versatile",
     groq_api_key=groq_key,
     temperature=0.2
 )
@@ -85,22 +91,36 @@ if user_input := st.chat_input("Type your technical inquiry or booking request h
 
     # LLM Execution with Circuit Breaker
     with st.chat_message("assistant"):
-        with st.spinner("Analyzing request..."):
+        with st.spinner("Executing agent pipeline..."):
             MAX_RETRIES = 2
             success = False
             response_text = ""
+            status_placeholder = st.empty()
 
             while st.session_state.retry_count < MAX_RETRIES and not success:
                 try:
+                    if simulate_failure:
+                        time.sleep(1)
+                        raise ConnectionResetError("Downstream DB / Tool connection timed out (Simulated).")
+                    
                     response = llm.invoke(st.session_state.chat_history)
                     response_text = response.content
                     success = True
                     st.session_state.retry_count = 0
                 except Exception as e:
                     st.session_state.retry_count += 1
-                    st.sidebar.error(f"Execution Failure! Retry attempt: {st.session_state.retry_count}")
-                    if st.session_state.retry_count >= MAX_RETRIES:
-                        response_text = "⚠️ [CIRCUIT BREAKER ACTIVATED]: External service latency exceeded. Token consumption halted to prevent bill runaway. Routing ticket to human operations."
+                    status_placeholder.warning(f"⚠️ Execution failure encountered. Retrying ({st.session_state.retry_count}/{MAX_RETRIES})...")
+                    st.sidebar.error(f"Execution Failure! Retry attempt: {st.session_state.retry_count}/{MAX_RETRIES}")
+                    time.sleep(1)
 
-            st.write(response_text)
+                    if not enable_circuit_breaker:
+                        # Infinite retry loop risk
+                        pass
+                    elif st.session_state.retry_count >= MAX_RETRIES:
+                        response_text = "🚨 **[CIRCUIT BREAKER TRIGGERED]**: Downstream execution boundaries exceeded (Max 2 retries). Pipeline halted to prevent runaway token costs. Gracefully routing request to Human Operations Tier."
+                        st.sidebar.error("🚨 Circuit Breaker: Tripped & Execution Terminated")
+
+            status_placeholder.empty()
+            st.markdown(response_text)
             st.session_state.chat_history.append(AIMessage(content=response_text))
+            st.session_state.retry_count = 0

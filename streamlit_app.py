@@ -5,12 +5,13 @@ import streamlit as st
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langfuse.langchain import CallbackHandler
 
 load_dotenv()
 
 st.set_page_config(page_title="Enterprise AI Support Agent", page_icon="🛡️", layout="wide")
 st.title("🛡️ Enterprise AI Support & Booking Agent")
-st.caption("Production-hardened LLM pipeline with Circuit Breakers & Pre-Retrieval PII Masking")
+st.caption("Production-hardened LLM pipeline with Circuit Breakers, Observability & PII Masking")
 
 # Engineering Observability Panel
 st.sidebar.header("⚙️ Production Guardrails")
@@ -46,7 +47,7 @@ def sanitize_pii(text: str) -> tuple[str, bool]:
 # 2. LLM Setup
 groq_key = os.getenv("GROQ_API_KEY")
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="openai/gpt-oss-20b",
     groq_api_key=groq_key,
     temperature=0.2
 )
@@ -89,7 +90,7 @@ if user_input := st.chat_input("Type your technical inquiry or booking request h
 
     st.session_state.chat_history.append(HumanMessage(content=processed_input))
 
-    # LLM Execution with Circuit Breaker
+    # LLM Execution with Circuit Breaker & Langfuse Tracing
     with st.chat_message("assistant"):
         with st.spinner("Executing agent pipeline..."):
             MAX_RETRIES = 2
@@ -97,16 +98,27 @@ if user_input := st.chat_input("Type your technical inquiry or booking request h
             response_text = ""
             status_placeholder = st.empty()
 
+            # Initialize Langfuse Callback Handler
+            langfuse_handler = CallbackHandler()
+
             while st.session_state.retry_count < MAX_RETRIES and not success:
                 try:
                     if simulate_failure:
                         time.sleep(1)
                         raise ConnectionResetError("Downstream DB / Tool connection timed out (Simulated).")
                     
-                    response = llm.invoke(st.session_state.chat_history)
+                    # LLM invoke with Langfuse callback
+                    response = llm.invoke(
+                        st.session_state.chat_history,
+                        config={"callbacks": [langfuse_handler]}
+                    )
                     response_text = response.content
                     success = True
                     st.session_state.retry_count = 0
+
+                    # Flush trace to Langfuse dashboard immediately
+                    langfuse_handler.flush()
+
                 except Exception as e:
                     st.session_state.retry_count += 1
                     status_placeholder.warning(f"⚠️ Execution failure encountered. Retrying ({st.session_state.retry_count}/{MAX_RETRIES})...")
@@ -114,7 +126,6 @@ if user_input := st.chat_input("Type your technical inquiry or booking request h
                     time.sleep(1)
 
                     if not enable_circuit_breaker:
-                        # Infinite retry loop risk
                         pass
                     elif st.session_state.retry_count >= MAX_RETRIES:
                         response_text = "🚨 **[CIRCUIT BREAKER TRIGGERED]**: Downstream execution boundaries exceeded (Max 2 retries). Pipeline halted to prevent runaway token costs. Gracefully routing request to Human Operations Tier."
